@@ -60,10 +60,8 @@ jmp dword 0x0010:flush ; 段选择子的描述符索引为2号描述符
 
 [bits 32]
 
-; 在保护模式下访问
-flush:
 ; 开始加载内核
-
+flush:
 ; 初始化各段寄存器
 mov eax, 0x0008
 mov ds,eax ; DS指向数据段的4GB内存空间
@@ -78,20 +76,95 @@ mov eax, core_start_sector
 mov ebx, edi
 call read_first_disk ; 调用过程读取内核程序的第一个扇区
 
-; 判断内核程序有多大
+; 计算内核程序所占扇区数
 mov eax, [edi] ; 内核程序总大小
+xor edx, edx
+mov ecx, 512
+div ecx
+
+or edx, edx ; 判断是否能整除
+jnz @1 ; 未能整除，剩余扇区不需要再减1
+dec eax ; 已经读取了一个扇区，得出剩余的扇区数
+
+; 未能整除时
+@1:
+; 若内核程序总大小不到一个扇区
+or eax, eax
+jz setup
+; 读取剩余扇区
+mov ecx, eax ; 待读取的剩余的扇区数
+mov eax, core_start_sector
+inc eax ; 第二个逻辑扇区
+
+; 从逻辑扇区读取剩余内核程序
+@2:
+call read_first_disk
+inc eax
+loop @2
+
+; 安装内核程序的各个段描述符
+setup:
+mov esi, [0x0070 + pgdt + 0x02] # ESI指向GDT起始线性地址
+
+; 建立公共例程段描述符
+mov eax, [edi + 0x04] ; 公共例程段起始汇编地址
+mov ebx, [edi + 0x08] ; 核心数据段起始汇编地址
+
+sub ebx, eax ; 计算公共例程段界限
+dec ebx
+
+add eax, edi ; 公共例程段在内存的线性地址
+mov ecx, 0x00409800 ; 字节粒度的代码段描述符
+call make_gdt_descriptor ; 调用过程，获得描述符
+
+mov [esi + 0x28], eax ; #5描述符，内核公共例程段描述符
+mov [esi + 0x2c], edx
+
+; 建立核心数据段描述符
+mov eax, [edi + 0x08] ; 核心数据段起始汇编地址
+mov ebx, [edi + 0x0c] ; 核心代码段起始汇编地址
+
+sub ebx,eax ; 计算核心数据段界限
+dec ebx
+
+add eax, edi ; 核心数据段在内存中的线性地址
+mov eax, 0x00409200 ; 字节粒度在数据段描述符
+call make_gdt_descriptor ; 调用过程，获得描述符
+
+mov [esi + 0x30], eax ; #6描述符，内核核心数据段描述符
+mov [esi + 0x34], edx
+
+; 建立核心代码段数据描述符
+mov eax, [edi + 0x0c] ; 核心代码段起始汇编地址
+mov ebx, [edi + 0x00] ; 内核程序总长度
+
+sub ebx, eax ; 计算核心代码段界限
+dec ebx
+
+add eax, edi ; 核心代码段在内存中的线性地址
+mov ecx, 0x00409800 ; 字节粒度的代码段描述符
+call make_gdt_descriptor ; 调用过程，获得描述符
+
+mov [esi + 0x30], eax ; #7描述符，内核核心代码段描述符
+mov [esi + 0x34], edx
+
+; 重新加载GDTR
+mov word [0x7c00 + pgdt], 63 ; 通过4GB数据段修改GDTR界限
+lgdt [0x7c00 + pgdt]
+
+; 跳转至内核核心程序入口处
+jmp far [edi + 0x10]
+
+
 
 
 ; 从硬盘读取一个逻辑扇区
 read_first_disk:
-push eax
-push ecx
-push edx
-
-push eax
 
 
 
+; 构造描述符
+make_gdt_descriptor:
 
 
 
@@ -99,3 +172,6 @@ push eax
 pgdt:
 dw 0 ; GDT界限
 dd 0x00007e00 ; GDT线性基地址
+
+times 510 - ($-$$) db 0
+                   db 0x55, 0xaa
