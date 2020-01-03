@@ -1,5 +1,6 @@
 ; 用户程序
 
+; ===================================================================
 ; 文件头，用于内核的识别和加载
 SECTION header vstart=0
 
@@ -13,7 +14,7 @@ SECTION header vstart=0
     code_seg dd section.code.start ; 代码段起始汇编地址 #0x14
     code_len dd code_end ; 代码段长度 #0x18
 
-    data_seg dd section.data.start ; 数据段起始汇编地址 #0x0c
+    data_seg dd section.data.start ; 数据段起始汇编地址 #0x1c
     data_len dd data_end ; 数据段长度 #0x20
 
 ; 建立符号-地址检索表
