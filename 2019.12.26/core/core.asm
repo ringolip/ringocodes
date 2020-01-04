@@ -3,6 +3,7 @@
 ; 定义常量
 core_code_seg_sel     equ 0x38    ; 内核代码段选择子 #7
 core_data_seg_sel     equ 0x30    ; 内核数据段选择子 #6
+core_stack_seg_sel    equ 0x18    ; 内核堆栈段选择子 #3
 sys_rountine_seg_sel  equ 0x28    ; 内核公共例程段选择子 #5
 all_memory_seg_sel    equ 0x08    ; 整个0-4GB内存数据段选择子 #1
 
@@ -24,14 +25,16 @@ core_entry dd start ; 32位段内偏移地址
 ; 内核公共例程代码段
 SECTION sys_rountine vstart=0
 
-; 字符串显示例程
-put_string:
+
+put_string:                       ; 字符串显示例程
+                                  ; 输入：DS:EBX=字符串地址
 
 put_char:
 
-; 读取逻辑扇区例程
-read_hard_disk:
-
+read_hard_disk:                   ; 读取逻辑扇区例程
+                                  ; 输入：EAX=起始逻辑扇区号
+                                  ; 输入：DS:EBX=目标缓冲区地址
+                                  ; 输出：EBX=EBX+512
 ; -------------------------------------------------------------------
 ; 分配内存例程
 allocate_memory:
@@ -144,6 +147,29 @@ SECTION core_data vstart=0
 
     ram_allocate: dd 0x00100000   ; 下次分配内存时的起始地址，初始地址为0x00100000
 
+    ; 符号地址检索表
+    salt:
+    salt_1:    db '@PrintString'  ; 符号名占256字节
+               times 256-($-salt_1) db 0
+               dd put_string      ; 例程偏移地址32位
+               dw sys_rountine_seg_sel ; 公共例程段段选择子
+
+    salt_2:    db '@ReadDiskData'
+               times 256-($-salt_2) db 0
+               dd read_hard_disk
+               dw sys_rountine_seg_sel
+
+    salt_3:
+
+    salt_4:    db '@TerminateProgram'
+               times 256-($-salt_4) db 0
+               dd return_point
+               dw core_code_seg_sel
+
+    salt_item_len equ $-salt_4
+    salt_items    equ ($-salt)/salt_item_len ; 内核SALT表项数目
+
+
     message_1: db '  If you seen this message,that means we '
                db 'are now in protect mode,and the system '
                db  'core is loaded,and the video display '
@@ -151,7 +177,14 @@ SECTION core_data vstart=0
 
     message_5: db '  Loading user program...',0
 
+    message_6: db  0x0d,0x0a,0x0d,0x0a,0x0d,0x0a
+               db  '  User program terminated,control returned.',0
+
+    do_status: db 'Done.', 0x0d, 0x0a, 0
+
     core_buffer: times 2048 db 0  ; 内核缓冲区：分析、加工、中转数据
+
+    esp_pointer: dd 0             ; 内核用来临时保存自己的栈指针
 
     brand0:    db 0x0d, 0x0a, ' ', 0
     brand:     times 52 db 0
@@ -161,12 +194,14 @@ SECTION core_data vstart=0
 ; 内核核心代码段
 SECTION core_code vstart=0
 
-; 加载并重定位用户程序
-load_relocate_program:
+; -------------------------------------------------------------------
+load_relocate_program:            ; 加载并重定位用户程序
+                                  ; 输入：ESI=用户程序起始逻辑扇区号
+                                  ; 输出：AX=指向用户程序头部段选择子
     push ebx
     push ecx
     push edx
-    push esi                      ; esi存储用户程序其实逻辑扇区号
+    push esi                      ; esi存储用户程序起始逻辑扇区号
     push edi
 
     push ds
@@ -205,7 +240,7 @@ load_relocate_program:
 
     mov eax, esi                  ; 用户程序起始扇区号
 
-    .b1:
+  .b1:
     ; 将用户程序全部从扇区读至内存
     call sys_rountine_seg_sel:read_hard_disk ; 起始线性地址已经位于EBX中
     inc eax
@@ -256,8 +291,65 @@ load_relocate_program:
     call sys_rountine_seg_sel:set_up_gdt_descriptor
     mov [edi+0x08], cx
 
+    ; 重定位用户程序SALT
+    mov eax, [edi+0x04]           ; 用户程序头部段选择子
+    mov es, eax                   ; ES
 
+    mov eax, core_code_seg_sel    ; 内核数据段选择子
+    mov ds, eax                   ; DS
 
+    cld                           ; 清除方向标志位，正向进行比较
+
+    mov ecx, [edi+0x24]           ; 用户程序SALT中的符号数
+    mov edi, [edi+0x28]           ; ES:EDI指向用户程序SALT
+
+  .b2:                            ; 外循环，从用户SALT中依次取出符号
+    push ecx
+    push edi
+
+    ; 内循环 ,依次对比内核SALT各表项
+    mov ecx, salt_items           ; 内核SALT表项数
+    mov esi, salt                 ; DS:ESI指向内核SALT
+
+  .b3:
+    push edi
+    push esi
+    push ecx
+
+    mov ecx, 64                   ; 至多比较64次
+    repe cmpsd                    ; 每次比较4字节
+    jnz .b4                       ; 直到发现不相符的地方
+    mov eax, [esi]                ; 全部匹配，ESI此时指向符号对应例程的偏移地址
+    mov [es:edi-256], eax         ; 在用户程序符号处写入内核例程偏移地址
+    mov ax, [esi+4]               ; 内核段选择子
+    mov [es:edi-252], ax
+
+  .b4:                            ; 内循环，ESI指向内核SALT下一个表项
+    pop ecx
+    pop esi
+    add esi, salt_item_len
+    pop edi
+    loop .b3
+
+    pop edi                       ; 外循环，下一个用户SALT符号
+    add edi, 256
+    pop ecx
+    loop .b2
+
+    mov ax, [es:0x04]             ; 返回用户程序头部段选择子
+
+    pop es
+    pop ds
+
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+
+    ret
+
+; -------------------------------------------------------------------
 start:
     mov ecx, core_data_seg_sel ; DS指向内核数据段
     mov ds, ecx
@@ -303,14 +395,32 @@ start:
     mov ebx, message_5
     call sys_rountine_seg_sel:put_string
 
-    mov esi, 50 ; 用户程序位于50号逻辑扇区
-    call load_relocate_program ; 调用过程加载并重定位用户程序
+    mov esi, 50                   ; 用户程序位于50号逻辑扇区
+    call load_relocate_program    ; 调用过程加载并重定位用户程序
+
+    mov ebx, do_status
+    call sys_rountine_seg_sel:put_string
+
+    mov [esp_pointer], esp        ; 保存内核栈指针
+
+    mov ds, ax                    ; DS指向用户程序头部
+
+    jmp far [0x10]                ; 转向用户程序代码入口点执行
 
 
+; -------------------------------------------------------------------
+; 用户程序返回点
+return_point:
+    mov eax, core_code_seg_sel    ; DS指向内核数据段
+    mov ds, eax
 
+    mov eax, core_stack_seg_sel   ; 切换回内核自己的堆栈
+    mov ss, eax
+    mov esp, [esp_pointer]
 
+    mov ebx, message_6            ; 显示回到内核信息
+    call sys_rountine_seg_sel:put_string
 
-
-
+    hlt
 
 core_end:
