@@ -5,12 +5,22 @@ core_data_seg_sel      equ 0x30                 ; 内核数据段选择子
 core_code_seg_sel      equ 0x38                 ; 内核代码段选择子
 sys_routine_seg_sel    equ 0x28                 ; 公共例程段选择子
 core_stack_seg_sel     equ 0x18                 ; 内核堆栈选择子
+all_memory_seg_sel     equ 0x0008               ; 整个0-4GB内存空间段选择子
 
 ; ===================================================================
 SECTION sys_routine vstart=0
 ; -------------------------------------------------------------------
 ; 显示字符串例程
 put_string:                                     ; 输入：DS:EBX=字符串地址
+
+
+; -------------------------------------------------------------------
+; 读取硬盘所选逻辑扇区
+read_hard_disk:
+                                                ; 输入：EAX=逻辑扇区号
+                                                ;      DS:EBX=内核缓冲区地址
+                                                ; 输出：EBX=EBX+12
+
 
 ; -------------------------------------------------------------------
 ; 分配内存
@@ -23,6 +33,15 @@ allocate_memory:                                ; 输入：ECX=希望分配的�
 set_up_gdt_descriptor:
                                                 ; 输入：EAX:EAX=描述符
                                                 ; 输出：CX=描述符选择子
+
+; -------------------------------------------------------------------
+; 构造段描述符
+make_seg_descriptor:                            ; 输入：EAX=段的线性基地址
+                                                ;      EBX=段界限
+                                                ;      ECX=段属性
+                                                ; 输出：EDX:EAX=段描述符
+
+
 
 ; -------------------------------------------------------------------
 ; 构造门描述符
@@ -54,6 +73,9 @@ SECTION core_data vstart=0
     message_2          db '  System wide CALL-GATE mounted.',0x0d,0x0a,0
 
     message_3          db 0x0d,0x0a,'  Loading user program...',0
+
+    core_buffer        times 2048 db 0          ; 内核缓冲区
+
     cpu_brand0         db 0x0d,0x0a,'  ',0
     cpu_brand          times 52 db 0            ; cpu信息
     cpu_brand1         db 0x0d,0x0a,0x0d,0x0a,0
@@ -65,11 +87,143 @@ SECTION core_data vstart=0
 ; 内核代码段
 SECTION core_code vstart=0
 ; -------------------------------------------------------------------
+; 在LDT中安装描述符
+fill_descriptor_in_ldt:
+                                                ; 输入：EDX:EAX=描述符
+                                                ;      EBX=TCB基地址
+                                                ; 输出：CX=描述符选择子
+    push eax
+    push edx
+    push edi
+    push ds
+
+    mov ecx, all_memory_seg_sel
+    mov ds, ecx
+
+    mov edi, [ebx+0x0c]                         ; 获得LDT基地址
+
+    xor ecx, ecx
+    mov cx, [ebx+0x0a]                          ; 获得LDT界限
+    inc cx                                      ; LDT总字节数
+
+    mov [edi+ecx+0x00], eax                     ; 安装描述符低32位
+    mov [edi+ecx+0x04], edx                     ; 安装描述符高32位
+
+    add cx, 8                                   ; 更新LDT界限值
+    dec cx
+    mov [ebx+0x0a], cx
+
+    mov ax, cx                                  ; 计算当前描述符索引值
+    xor dx, dx
+    mov cx, 8
+    div cx
+
+    mov cx, ax
+    shl cx                                      ; 当前描述符索引值
+    or cx, 0000_0000_0000_0100B                 ; 段选择子，TI=1，指向LDT，RPL=00
+
+    pop ds
+    pop edi
+    pop edx
+    pop eax
+
+    ret
+
+; -------------------------------------------------------------------
+; 加载并重定位用户程序
+load_relocate_program:
+                                                ; 输入：PUSH 逻辑扇区号
+                                                ;      PUSH 任务控制块基地址
+                                                ; 输出：无
+
+    pushad                                      ; 寄存器压栈
+
+    push ds
+    push es
+
+    mov ebp, esp                                ; 方便访问堆栈中的内容
+
+    mov eax, all_memory_seg_sel
+    mov es, eax
+
+    mov ecx, 160
+    call sys_routine_seg_sel:allocate_memory    ; 申请内存空间，用于创建LDT
+
+    mov esi, [ebp+11*4]                         ; TCB起始线性地址
+    mov [es:esi+0x0c], ecx                      ; 将LDT线性地址登记到TCB中
+    mov [es:esi+0x0a], 0xffff                   ; LDT现在为0字节，所以界限值为0xffff
+
+    mov eax, core_data_seg_sel
+    mov ds, eax
+
+    mov eax, [ebp+12*4]                         ; 用户程序所在逻辑扇区号
+    mov ebx, core_buffer
+    call sys_routine_seg_sel:read_hard_disk     ; 读取用户程序第一个逻辑扇区
+
+    pass                                        ; 判断用户程序的大小
+
+    mov ecx, eax                                ; 申请用户程序内存空间
+    call sys_routine_seg_sel:allocate_memory
+    mov [es:esi+0x06], ecx                      ; 将用户程序线性地址登记到TCB中
+
+    pass                                        ; 加载用户程序至内存
+
+    mov edi, [es:esi+0x06]                      ; 用户程序基地址
+
+    ; 建立头部段描述符
+    mov eax, edi
+    mov ebx, [edi+0x04]                         ; 头部段长度
+    dec ebx
+    mov ecx, 0x0040f200                         ; 0100_1111_0010，特权级DPL为3
+    call sys_routine_seg_sel:make_seg_descriptor
+
+    ; 在LDT中安装描述符
+    mov ebx, esi                                ; TCB起始线性地址
+    call fill_descriptor_in_ldt
+
+    or cx, 0000_0000_0000_0011B                 ; 设置头部选择子请求特权级RPL置3
+    mov [es:esi+0x44], cx                       ; 登记头部选择子到TCB
+    mov [edi+0x04]                              ; 登记头部选择子到头部程序
+
+
+; -------------------------------------------------------------------
 ; 在TCB链表上追加任务控制块
 append_to_tcb_link:                             ; 输入：ECX=TCB线性基地址
+    push eax
+    push edx
+    push ds
+    push es
 
+    mov eax, core_data_seg_sel                  ; DS指向内核数据段，以访问tcb_chain
+    mov ds, eax
+    mov eax, all_memory_seg_sel                 ; ES指向4G内存空间，以访问所有TCB
+    mov es, eax
 
+    mov dword [es:ecx], 0                       ; 当前TCB首地址内容清零，表明这是链表最后一个TCB
 
+    mov eax, [tcb_chain]                        ; 查看整个链表是否为空
+    or eax, eax
+    jz .notcb
+
+  .searc:
+    mov edx, eax                                ; 检查下一个TCB首地址内容是否为空
+    mov eax, [es:edx]
+    or eax, eax                                 ; 不为空则继续检查之后的TCB首地址内容
+    jnz .search
+
+    mov [es:edx], ecx                           ; 将此TCB的首地址，写入链表最后一项的首地址
+    jmp .retpc
+
+  .notcb:
+    mov [tcb_chain], ecx                        ; 链表为空，将链表内容指向当前TCB首地址
+
+  .retpc:
+    pop es
+    pop ds
+    pop edx
+    pop eax
+
+    ret
 
 ; -------------------------------------------------------------------
 ; 内核主程序
@@ -142,9 +296,20 @@ start:
     ; 加载用户程序并创建任务
     ; 创建任务控制快
     mov ecx, 0x46
-    call sys_routine_seg_sel:allocate_memory
+    call sys_routine_seg_sel:allocate_memory    ; 得到申请内存的起始线性地址ECX
+    call append_to_tcb_link                     ; 在TCB链表上追加TCB
 
+    ; 使用栈传递参数
+    push dword 50                               ; 用户程序位于的逻辑扇区
+    push eax                                    ; 当前TCB起始线性地址
 
+    call load_relocate_program                  ; 加载并重定位用户程序
+
+    ; 程序代码段描述符
+    ; 程序数据段描述符
+    ; 程序堆栈段描述符
+
+    ; 重定位用户程序的SALT表
 
 
 
