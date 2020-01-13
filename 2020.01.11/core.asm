@@ -82,8 +82,6 @@ start:
     ; 在页目录中创建与线性地址0x00000000对应的目录项
     mov dword [es:ebx+0x00], 0x21000003         ; 写入目录项（页表的物理地址和属性）
 
-
-
     ; 创建页表
     mov ebx, 0x00021000                         ; 页表的物理地址
     xor eax, eax                                ; 起始页的物理地址
@@ -93,6 +91,36 @@ start:
     mov edx, eax
     or edx, 0x00000003                          ; 写入页表项属性
     mov [es:ebx+esi*4], edx                     ; 登记页的物理地址
+    add eax, 0x1000                             ; 下一页的物理地址
+    inc esi                                     ; 下一个页表项
+    cmp esi, 256                                ; 只登记低端1MB的前256个页
+    jl .b2
+
+    ; 将页表其余表项登记为无效
+  .b3:
+    mov dword [es:ebx+esi*4], 0x00000000
+    inc esi
+    cmp esi, 1024
+    jl .b3
+
+    ; 将页目录表的物理基地址传送至寄存器CR3
+    mov eax, 0x00020000
+    mov cr3, eax
+
+    ; 开启页功能
+    mov eax, cr0
+    or eax, 0x80000000                            ; 将最高位置1
+    mov cr0, eax                                  ; 传回cr0，开启页功能
+
+    ; 在页目录内创建与线性地址0x80000000对应的目录项
+    ; 当线性地址高20位为0xfffff000时， 访问的就是页目录自己
+    mov ebx, 0xfffff000                           ; 页目录自己的线性地址
+    mov esi, 0x80000000
+    shr esi, 22                                   ; 保留高十位
+    shl esi, 2                                    ; 目录表内的偏移量
+    mov [es:ebx+esi], 0x00021003
+
+
 
 
 
