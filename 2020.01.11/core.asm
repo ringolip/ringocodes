@@ -8,23 +8,146 @@ core_stack_seg_sel     equ 0x18                 ; 内核堆栈选择子
 all_memory_seg_sel     equ 0x0008               ; 整个0-4GB内存空间段选择子
 
 ; 内核头部，用于加载内核头部
-core_length      dd core_end                    ;核心程序总长度#00
+core_length      dd core_end                    ; 核心程序总长度#00
 
-sys_routine_seg  dd section.sys_routine.start   ;系统公用例程段位置#04
+sys_routine_seg  dd section.sys_routine.start   ; 系统公用例程段位置#04
 
-core_data_seg    dd section.core_data.start     ;核心数据段位置#08
+core_data_seg    dd section.core_data.start     ; 核心数据段位置#08
 
-core_code_seg    dd section.core_code.start     ;核心代码段位置#0c
+core_code_seg    dd section.core_code.start     ; 核心代码段位置#0c
 
-core_entry       dd start                       ;核心代码段入口点#10
+core_entry       dd start                       ; 核心代码段入口点#10
                  dw core_code_seg_sel
+; ===================================================================
+SECTION sys_routine vstart=0
+; -------------------------------------------------------------------
+; 搜索空闲的页，并把它安装在页目录表和页表
+alloc_install_a_page:                           ; 输入：EBX=页的线性地址
+    push eax
+    push ebx
+    push esi
+    push ds
 
+    mov eax, all_memory_seg_sel
+    mov ds, eax
 
+    ; 检查该线性地址所对应页表是否存在
+    ; 得到该页目录项的线性地址
+    mov esi, ebx
+    and esi, 0xffc00000                        ; 保留线性地址的高10位
+    shr esi, 20                                ; 得到页目录索引的表内偏移
+    or esi, 0xfffff000                         ; 要访问目录项的线性地址
 
+    test dword [esi], 0x00000001               ; 检查页表是否已经存在
+    jnz .b1
 
+    ; 创建该线性地址所对应的页表
+    call alloc_a_4k_page                       ; 分配一个页作为页表
+    or eax, 0x00000007                         ; 为页表添加属性
+    mov [esi], eax                             ; 将页表登记至页目录
+
+  .b1:
+    ;分配一个最终的页
+    mov esi, ebx                               ; 页的线性地址
+    shr esi, 10
+    and esi, 0x003ff000
+    or esi, 0xffc00000                         ; 得到该页表的线性地址
+
+    and ebx, 0x003ff000
+    shr ebx, 10
+    or esi, ebx                                ; 页表项的线性地址
+
+    call alloc_install_a_page                  ; 分配一个页
+    or eax, 0x00000007                         ; 为页添加属性
+    mov [esi], eax                             ; 将页表项内容修改为页的物理地址
+
+    pop ds
+    pop esi
+    pop ebx
+    pop eax
+
+    retf
+
+; -------------------------------------------------------------------
+; 分配一个4KB的页
+alloc_a_4k_page:                                ; 输出：EAX=页的物理地址
+    push ebx
+    push ecx
+    push edx
+    push ds
+
+    mov eax, all_memory_seg_sel
+    mov ds, eax
+
+    xor eax, eax
+  .b1:
+    bts [page_bit_map], eax                     ; 检查位串
+    jnc .b2                                     ; 该比特空闲
+    inc eax                                     ; 测试下一位
+    cmp eax, page_map_len*8                     ; 判断是否测试了所有比特位
+    jl .b1
+
+    mov ebx, message_3                          ; 没有找到空闲页
+    call sys_routine_seg_sel:put_string
+    hlt
+
+  .b2:
+    shl eax, 12                                 ; 该比特所对应页表的物理地址
+
+    pop ds
+    pop edx
+    pop ecx
+    pop ebx
+
+    ret
 
 ; ===================================================================
-SECTION core_code vstrat=0
+SECTION core_data vstart=0
+; -------------------------------------------------------------------
+    pgdt               dw 0                     ; 用于设置和修改GDT
+                       dd 0
+    ;页映射位串
+    page_bit_map       db  0xff,0xff,0xff,0xff,0xff,0x55,0x55,0xff
+                       db  0xff,0xff,0xff,0xff,0xff,0x55,0x55,0xff
+                       db  0xff,0xff,0xff,0xff,0xff,0x55,0x55,0xff
+                       db  0xff,0xff,0xff,0xff,0xff,0x55,0x55,0xff ; 最低端1MB内存空间
+                       db  0x55,0x55,0x55,0x55,0x55,0x55,0x55,0x55
+                       db  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+                       db  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+                       db  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+    page_map_len       equ $ - page_bit_map     ; 位串的字节数
+
+  ;符号地址检索表
+  salt:
+    salt_1             db  '@PrintString'
+                       times 256-($-salt_1) db 0
+                       dd  put_string
+                       dw  sys_routine_seg_sel
+
+    salt_2             db  '@ReadDiskData'
+                       times 256-($-salt_2) db 0
+                       dd  read_hard_disk_0
+                       dw  sys_routine_seg_sel
+
+    salt_3             db  '@PrintDwordAsHexString'
+                       times 256-($-salt_3) db 0
+                       dd  put_hex_dword
+                       dw  sys_routine_seg_sel
+
+    salt_4             db  '@TerminateProgram'
+                       times 256-($-salt_4) db 0
+                       dd  terminate_current_task
+                       dw  sys_routine_seg_sel
+
+    salt_item_len      equ $-salt_4
+    salt_items         equ ($-salt)/salt_item_len
+    message_1          db  '  Paging is enabled.System core is mapped to'
+                       db  ' address 0x80000000.', 0x0d, 0x0a, 0
+
+    core_next_laddr    dd  0x80100000             ; 内核中下一个可用于自由分配的内存空间的线性地址
+
+; ===================================================================
+SECTION core_code vstart=0
 ; -------------------------------------------------------------------
 start:
     mov ecx, core_data_seg_sel
@@ -120,10 +243,84 @@ start:
     shl esi, 2                                    ; 目录表内的偏移量
     mov [es:ebx+esi], 0x00021003
 
+    sgdt [pgdt]                                   ; 获取GDT信息
+    mov ebx, [pgdt+2]                             ; GDT起始线性基地址
 
+    ; 将段描述符线性基地址加0x80000000
+    or dword [es:ebx+0x10+4], 0x80000000
+    or dword [es:ebx+0x18+4], 0x80000000
+    or dword [es:ebx+0x20+4], 0x80000000
+    or dword [es:ebx+0x28+4], 0x80000000
+    or dword [es:ebx+0x30+4], 0x80000000
+    or dword [es:ebx+0x38+4], 0x80000000
 
+    add dword [pgdt+2], 0x80000000                ; GDT起始线性基地址加0x80000000
 
+    lgdt [pgdt]                                   ; 使修改后的GDT生效
 
+    ; 显示刷新段寄存器内容，使处理器转去内存高地址执行
+    jmp core_code_seg_sel:flush
+
+  flush:
+    ; 重新加载段寄存器的高速缓存器
+    mov eax, core_stack_seg_sel
+    mov ss, eax
+
+    mov eax, core_data_seg_sel
+    mov ds, eax
+
+    mov ebx, message_1
+    call sys_routine_seg_sel:put_string
+
+    ; 安装供用户程序使用的调用门
+    mov edi, salt                                 ; 内核SALT表起始位置
+    mov ecx, salt_items                           ; 内核SALT表的条目数量
+  .b4:
+    push ecx
+    mov eax, [edi+256]                            ; 该条目入口点的32位偏移地址
+    mov bx, [edi+260]                             ; 该条目入口点的段选择子
+    mov cx, 1_11_0_1100_000_00000B                ; 特权级为3的调用门
+
+    call sys_routine_seg_sel:make_gate_descriptor
+    call sys_routine_seg_sel:set_up_gdt_descriptor
+
+    add [edi+260], cx                             ; 将调用门选择子回填
+    add edi, salt_item_len                        ; 指向下一个SALT条目
+    pop ecx
+    loop .b4
+
+    ; 对门进行测试
+    mov ebx, message_2
+    call far [salt_1+256]                         ; 通过门显示信息
+
+    ; 使内核的一部分成为任务
+
+    ; 创建内核任务的TSS
+    mov ebx, core_next_laddr
+    call sys_routine_seg_sel:alloc_install_a_page ; 申请物理页
+    add dword [core_next_laddr], 4096             ; 下一个可自由分配的内存空间的线性地址
+
+    ; 在程序管理器的TSS中设置必要的项目
+    mov word [es:ebx+0], 0                        ; 前一个任务的指针
+    mov eax, cr3
+    mov dword [es:ebx+28], eax                    ; 登记CR3
+
+    mov word [es:ebx+96], 0                       ; 没有LDT， 处理器允许没有LDT的任务
+    mov word [es:ebx+100], 0
+    mov word [es:ebx+102], 103                    ; 没有I/O位图
+
+    ; 创建程序管理器的TSS描述符，并安装到GDT中
+    mov eax, ebx
+    mov ebx, 103
+    mov ecx, 0x00408900
+    call sys_routine_seg_sel:make_seg_descriptor
+    call sys_routine_seg_sel:set_up_gdt_descriptor
+    mov [program_man_tss+4], cx                   ; 保存程序管理器的TSS描述符选择子
+
+    ; 将当前任务的TSS描述符传送到任务寄存器TR
+    ltr cx
+
+    ; "任务管理器"任务正在运行
 
 
 core_code_end:
