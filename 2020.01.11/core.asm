@@ -80,6 +80,7 @@ alloc_a_4k_page:                                ; 输出：EAX=页的物理地�
     mov ds, eax
 
     xor eax, eax
+
   .b1:
     bts [page_bit_map], eax                     ; 检查位串
     jnc .b2                                     ; 该比特空闲
@@ -100,6 +101,10 @@ alloc_a_4k_page:                                ; 输出：EAX=页的物理地�
     pop ebx
 
     ret
+; -------------------------------------------------------------------
+; 创建新页目录，并复制当前页目录内容
+create_copy_cur_pdir:                           ; 输入：无
+                                                ; 输出：EAX=新页目录的物理地址
 
 ; ===================================================================
 SECTION core_data vstart=0
@@ -148,6 +153,106 @@ SECTION core_data vstart=0
 
 ; ===================================================================
 SECTION core_code vstart=0
+; -------------------------------------------------------------------
+; 加载并重定位用户程序
+load_relocate_program:
+                                                ;输入: PUSH 逻辑扇区号
+                                                ;     PUSH 任务控制块基地址
+                                                ;输出：无
+    pushad
+
+    push ds
+    push es
+
+    mov esp, ebp
+
+    mov ecx, all_memory_seg_sel
+    mov es, ecx
+
+    ; 清空内核页目录的前半部分（对应低2GB的局部地址空间）
+    mov ebx, 0xfffff000                         ; 内核页目录表的线性地址
+    xor esi, esi                                ; 每个表项的索引号
+
+  .b1:
+    mov dword [es:ebx+esi*4], 0x00000000
+    inc esi
+    cmp esi, 512                                ; 清空前512项
+    jl .b1
+
+    ; 计算用户程序的大小
+    mov eax, core_data_seg_sel
+    mov ds, eax
+
+    mov eax, [ebp+12*4]                         ; 读取用户程序的参数
+    mov ebx, core_buff
+    call sys_routine_seg_sel:read_hard_disk_0   ; 读取用户程序所在的第一个逻辑扇区
+
+    mov eax, [core_buff]                        ; 判断程序的大小
+    mov ebx, eax
+    and ebx, 0xfffff000
+    add ebx, 0x1000
+    test eax, 0x00000fff
+    cmovnz eax, ebx
+
+    mov ecx, eax
+    shr ecx, 12                                 ; 用户程序占用的页数
+
+    ; 分配物理页，读取用户程序来填充页
+    mov eax, all_memory_seg_sel
+    mov ds, eax
+
+    mov eax, [ebp+12*4]                         ; 程序起始扇区号
+    mov esi, [ebp+11*4]                         ; 从堆栈中取得TCB的基地址
+
+  .b2:                                          ; 分配物理页
+    mov ebx, [es:esi+0x06]                      ; 程序下一个可用的内存空间线性地址
+    add dword [es:esi+0x06], 0x1000
+    call sys_routine_seg_sel:alloc_install_a_page
+
+    push ecx
+
+    mov ecx, 8
+
+  .b3:                                          ; 读取用户程序填充页
+    call sys_routine_seg_sel:read_hard_disk_0
+    inc eax
+    loop .b3
+
+    pop ecx
+    loop b2.
+
+    ; 在内核地址空间创建任务的TSS
+    mov eax, core_data_seg_sel
+    mov ds, eax
+
+    mov ebx, [core_next_laddr]                  ; 在全局空间上申请页
+    call sys_routine_seg_sel:alloc_install_a_page
+    add dword [core_next_laddr], 4096
+
+    mov [es:esi+0x14], ebx                      ; 在TCB中登记TSS的起始地址
+    mov word [es:esi+0x12], 103                 ; 在TCB中填写TSS的界限值
+
+    ; 在任务的局部地址空间创建LDT
+    mov ebx, [es:esi+0x06]                      ; 从TCB中取得可用的线性地址
+    add dword [es:esi+0x06], 0x1000
+    call sys_routine_seg_sel:alloc_install_a_page
+    mov [es:esi+0x0c], ebx                      ; 在TCB中登记GDT线性地址
+
+    ; 创建程序代码段描述符
+
+    ; 创建程序数据段描述符
+
+    ; 将数据段作为任务特权级3的固有堆栈
+
+    ; 在任务局部地址空间创建0，1，2特权级堆栈
+
+    ; 创建任务的页目录
+
+; -------------------------------------------------------------------
+; 在TCB链上追加任务控制块
+append_to_tcb_link:
+                                                ;输入：ECX=TCB线性基地址
+
 ; -------------------------------------------------------------------
 start:
     mov ecx, core_data_seg_sel
@@ -296,7 +401,7 @@ start:
     ; 使内核的一部分成为任务
 
     ; 创建内核任务的TSS
-    mov ebx, core_next_laddr
+    mov ebx, [core_next_laddr]
     call sys_routine_seg_sel:alloc_install_a_page ; 申请物理页
     add dword [core_next_laddr], 4096             ; 下一个可自由分配的内存空间的线性地址
 
@@ -321,6 +426,22 @@ start:
     ltr cx
 
     ; "任务管理器"任务正在运行
+
+    ; 创建用户程序TCB
+    mov ebx, [core_next_laddr]                    ; 申请物理页
+    call sys_routine_seg_sel:alloc_install_a_page
+    add dword [core_next_laddr], 4096
+
+    ; 初始化TCB
+    mov [es:ebx+0x06], 0                          ; 任务的下一个可用局部内存空间的线性地址
+    mov [es:ebx+0x0a], 0xffff                     ; LDT初始界限值
+    mov ecx, ebx
+    call append_to_tcb_link                       ; 将TCB添加到TCB链上
+
+    ; 传入参数，调用过程
+    push dword 50
+    push ecx
+    call load_relocate_program
 
 
 core_code_end:
